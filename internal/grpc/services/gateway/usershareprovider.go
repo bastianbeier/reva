@@ -38,32 +38,34 @@ import (
 )
 
 // TODO(labkode): add multi-phase commit logic when commit share or commit ref is enabled.
+// See reva ADR 003
 func (s *svc) CreateShare(ctx context.Context, req *collaboration.CreateShareRequest) (*collaboration.CreateShareResponse, error) {
 	if s.isSharedFolder(ctx, req.ResourceInfo.GetPath()) {
 		return nil, errtypes.AlreadyExists("gateway: can't share the share folder itself")
 	}
 
-	c, err := pool.GetUserShareProviderClient(pool.Endpoint(s.c.UserShareProviderEndpoint))
+	shareClient, err := pool.GetUserShareProviderClient(pool.Endpoint(s.c.UserShareProviderEndpoint))
 	if err != nil {
 		return &collaboration.CreateShareResponse{
 			Status: status.NewInternal(ctx, err, "error getting user share provider client"),
 		}, nil
 	}
 
-	// TODO the user share manager needs to be able to decide if the current user is allowed to create that share (and not eg. incerase permissions)
-	// jfd: AFAICT this can only be determined by a storage driver - either the storage provider is queried first or the share manager needs to access the storage using a storage driver
-	res, err := c.CreateShare(ctx, req)
-	if err != nil {
-		return nil, errors.Wrap(err, "gateway: error calling CreateShare")
-	}
-	if res.Status.Code != rpc.Code_CODE_OK {
-		return res, nil
-	}
+	// First we ping the db
+	// --------------------
 
-	// if we don't need to commit we return earlier
-	if !s.c.CommitShareToStorageGrant && !s.c.CommitShareToStorageRef {
-		return res, nil
-	}
+	// Then we set ACLs on the storage layer
+	// -------------------------------------
+
+	// First, we keep a copy of the original permissions, so we can revert if necessary
+	statResp, err := s.Stat(ctx, &provider.StatRequest{
+		Ref: &provider.Reference{
+			ResourceId: req.ResourceInfo.Id,
+			Path:       req.ResourceInfo.Path,
+		},
+	})
+
+	originalPermissions := statResp.GetInfo().PermissionSet
 
 	// TODO(labkode): if both commits are enabled they could be done concurrently.
 	if s.c.CommitShareToStorageGrant {
@@ -78,18 +80,33 @@ func (s *svc) CreateShare(ctx context.Context, req *collaboration.CreateShareReq
 					Status: denyGrantStatus,
 				}, err
 			}
-			return res, nil
+			// return res, nil
+		} else {
+			addGrantStatus, err := s.addGrant(ctx, req.ResourceInfo.Id, req.Grant.Grantee, req.Grant.Permissions.Permissions)
+			if err != nil {
+				return nil, errors.Wrap(err, "gateway: error adding grant to storage")
+			}
+			if addGrantStatus.Code != rpc.Code_CODE_OK {
+				return &collaboration.CreateShareResponse{
+					Status: addGrantStatus,
+				}, err
+			}
 		}
+	}
 
-		addGrantStatus, err := s.addGrant(ctx, req.ResourceInfo.Id, req.Grant.Grantee, req.Grant.Permissions.Permissions)
-		if err != nil {
-			return nil, errors.Wrap(err, "gateway: error adding grant to storage")
-		}
-		if addGrantStatus.Code != rpc.Code_CODE_OK {
-			return &collaboration.CreateShareResponse{
-				Status: addGrantStatus,
-			}, err
-		}
+	// Then we commit to the db
+	// ------------------------
+
+	// TODO the user share manager needs to be able to decide if the current user is allowed to create that share (and not eg. incerase permissions)
+	// jfd: AFAICT this can only be determined by a storage driver - either the storage provider is queried first or the share manager needs to access the storage using a storage driver
+	res, err := shareClient.CreateShare(ctx, req)
+
+	// If this fails, we undo updating the storage provider
+	if err != nil {
+		return nil, errors.Wrap(err, "gateway: error calling CreateShare")
+	}
+	if res.Status.Code != rpc.Code_CODE_OK {
+		return res, nil
 	}
 
 	return res, nil
