@@ -53,19 +53,24 @@ func (s *svc) CreateShare(ctx context.Context, req *collaboration.CreateShareReq
 
 	// First we ping the db
 	// --------------------
-
-	// Then we set ACLs on the storage layer
-	// -------------------------------------
-
-	// First, we keep a copy of the original permissions, so we can revert if necessary
-	statResp, err := s.Stat(ctx, &provider.StatRequest{
-		Ref: &provider.Reference{
-			ResourceId: req.ResourceInfo.Id,
-			Path:       req.ResourceInfo.Path,
+	// See ADR-REVA-003
+	_, err = shareClient.GetShare(ctx, &collaboration.GetShareRequest{
+		Ref: &collaboration.ShareReference{
+			Spec: &collaboration.ShareReference_Id{
+				Id: &collaboration.ShareId{
+					OpaqueId: "0",
+				},
+			},
 		},
 	})
 
-	originalPermissions := statResp.GetInfo().PermissionSet
+	// We expect a "not found" error when querying ID 0
+	if err != errtypes.NotFound("0") {
+		return nil, errtypes.InternalError("ShareManager is not online")
+	}
+
+	// Then we set ACLs on the storage layer
+	// -------------------------------------
 
 	// TODO(labkode): if both commits are enabled they could be done concurrently.
 	if s.c.CommitShareToStorageGrant {
@@ -101,7 +106,6 @@ func (s *svc) CreateShare(ctx context.Context, req *collaboration.CreateShareReq
 	// jfd: AFAICT this can only be determined by a storage driver - either the storage provider is queried first or the share manager needs to access the storage using a storage driver
 	res, err := shareClient.CreateShare(ctx, req)
 
-	// If this fails, we undo updating the storage provider
 	if err != nil {
 		return nil, errors.Wrap(err, "gateway: error calling CreateShare")
 	}
